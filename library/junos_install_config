@@ -213,6 +213,7 @@ import logging
 from os.path import isfile
 import os
 from distutils.version import LooseVersion
+from jnpr.junos.exception import ConnectAuthError
 
 
 def _load_via_netconf(module):
@@ -251,134 +252,102 @@ def _load_via_netconf(module):
         module.fail_json(msg=msg)
 
     logging.info("connecting to host: {0}@{1}:{2}".format(args['user'], args['host'], args['port']))
-
     try:
-        dev = Device(args['host'], user=args['user'], password=args['passwd'], port=args['port'],
+        with Device(args['host'], user=args['user'], password=args['passwd'], port=args['port'],
                      ssh_private_key_file=args['ssh_private_key_file'], mode=args['mode'],
-                     gather_facts=False)
-        dev.open()
-    except Exception as err:
+                     gather_facts=False) as dev:
+
+            timeout = int(args['timeout'])
+            if timeout > 0:
+                dev.timeout = timeout
+
+            results = {}
+
+            file_path = module.params['file']
+            file_path = os.path.abspath(file_path)
+
+            results['file'] = file_path
+            results['changed'] = False
+
+            logging.info("loading config")
+            load_args = {'path': file_path}
+            if replace is True:
+                load_args['merge'] = False
+            elif overwrite is True:
+                load_args['overwrite'] = True
+            elif update is True:
+                load_args['update'] = True
+            elif overwrite is False:
+                load_args['merge'] = True
+
+            with Config(dev, mode='private') as cu:
+                try:
+                    logging.info("pushing file: {0}".format(file_path))
+                    cu.load(**load_args)
+                except (ValueError, ConfigLoadError, Exception) as err:
+                    msg = "Unable to load config: {0}".format(err)
+                    logging.error(msg)
+                    module.fail_json(msg=msg)
+
+                diff = cu.diff()
+
+                if diff is not None:
+                    results['changed'] = True
+                    if getattr(module,'_diff',False) is True:
+                        results['diff'] = dict(
+                            prepared = diff
+                        )
+                    diffs_file = args['diffs_file']
+                    if diffs_file is not None:
+                        try:
+                            f = open(diffs_file, 'w')
+                            f.write(diff.encode('utf-8', 'ignore'))
+                            f.close()
+                        except IOError as (errno, strerror):
+                            msg = "Problem with diffs_file {0}: ".format(diffs_file)
+                            msg += "I/O Error: ({0}): {1}".format(errno, strerror)
+                            logging.error(msg)
+                            module.fail_json(msg=msg)
+                        except Exception as err:
+                            msg = "Problem with diffs_file {0}: ".format(diffs_file)
+                            msg += "Unexpected error: {0}".format(err)
+                            logging.error(msg)
+                            module.fail_json(msg=msg)
+                        logging.info("doing a commit-check, please be patient")
+                        cu.commit_check()
+                        if (in_check_mode):
+                            logging.info("Ansible check mode complete")
+                            module.exit_json(**results)
+                        else:
+                            logging.info("committing change, please be patient")
+                            opts = {}
+                            if args['comment'] is not None:
+                                opts['comment'] = args['comment']
+                            if args['confirm'] is not None:
+                                opts['confirm'] = args['confirm']
+
+                            if args['check_commit_wait']:
+                               check_commit_wait = int(args['check_commit_wait'])
+                               if 1 <= check_commit_wait <= 4:
+                                  time.sleep(check_commit_wait)
+                            cu.commit(**opts)
+
+                logging.info("change completed")
+
+    except ConnectAuthError as err:
         msg = 'unable to connect to {0}: {1}'.format(args['host'], str(err))
         logging.error(msg)
         module.fail_json(msg=msg)
-        return
-
-    timeout = int(args['timeout'])
-    if timeout > 0:
-        dev.timeout = timeout
-
-    cu = Config(dev)
-
-    results = {}
-
-    file_path = module.params['file']
-    file_path = os.path.abspath(file_path)
-
-    results['file'] = file_path
-    results['changed'] = False
-
-    logging.info("pushing file: {0}".format(file_path))
-    try:
-        logging.info("taking lock")
-        cu.lock()
-
-    except LockError:
-        msg = "Unable to lock configuration"
+    except CommitError as err:
+        msg = "Unable to commit configuration: {0}".format(err)
         logging.error(msg)
         module.fail_json(msg=msg)
 
-    try:
-        # load the config.  the cu.load will raise
-        # an exception if there is even a warning.
-        # so we want to avoid that condition.
-        logging.info("loading config")
-        load_args = {'path': file_path}
-        if replace is True:
-            load_args['merge'] = False
-        elif overwrite is True:
-            load_args['overwrite'] = True
-        elif update is True:
-            load_args['update'] = True
-        elif overwrite is False:
-            load_args['merge'] = True
-        cu.load(**load_args)
-    except (ValueError, ConfigLoadError, Exception) as err:
+    except Exception as err:
         msg = "Unable to load config: {0}".format(err)
         logging.error(msg)
-        try:
-            logging.info("unlocking")
-            cu.unlock()
-        except UnlockError as err:
-            logging.error("Unable to unlock config: {0}".format(err))
-        dev.close()
         module.fail_json(msg=msg)
 
-    diff = cu.diff()
-
-    if diff is not None:
-        results['changed'] = True
-        if getattr(module,'_diff',False) is True:
-            results['diff'] = dict(
-                prepared = diff
-            )
-        diffs_file = args['diffs_file']
-        if diffs_file is not None:
-            try:
-                f = open(diffs_file, 'w')
-                f.write(diff.encode('utf-8', 'ignore'))
-                f.close()
-            except IOError as (errno, strerror):
-                msg = "Problem with diffs_file {0}: ".format(diffs_file)
-                msg += "I/O Error: ({0}): {1}".format(errno, strerror)
-                logging.error(msg)
-                module.fail_json(msg=msg)
-            except Exception as err:
-                msg = "Problem with diffs_file {0}: ".format(diffs_file)
-                msg += "Unexpected error: {0}".format(err)
-                logging.error(msg)
-                module.fail_json(msg=msg)
-
-        try:
-            logging.info("doing a commit-check, please be patient")
-            cu.commit_check()
-            if (in_check_mode):
-                logging.info("Ansible check mode complete")
-                module.exit_json(**results)
-            else:
-                logging.info("committing change, please be patient")
-                opts = {}
-                if args['comment'] is not None:
-                    opts['comment'] = args['comment']
-                if args['confirm'] is not None:
-                    opts['confirm'] = args['confirm']
-
-                if args['check_commit_wait']:
-                   check_commit_wait = int(args['check_commit_wait'])
-                   if 1 <= check_commit_wait <= 4:
-                      time.sleep(check_commit_wait)
-
-                cu.commit(**opts)
-
-        except CommitError as err:
-            msg = "Unable to commit configuration: {0}".format(err)
-            logging.error(msg)
-            try:
-                logging.info("unlocking")
-                cu.unlock()
-            except UnlockError as err:
-                logging.error("Unable to unlock config: {0}".format(err))
-            dev.close()
-            module.fail_json(msg=msg)
-
-    try:
-        logging.info("unlocking")
-        cu.unlock()
-    except UnlockError as err:
-        logging.error("Unable to unlock config: {0}".format(err))
-
-    logging.info("change completed")
-
-    dev.close()
     module.exit_json(**results)
 
 
